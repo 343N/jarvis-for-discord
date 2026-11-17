@@ -9,10 +9,7 @@ env file has settings and your api keys and shit
 
 #### mandatory 
 - DISCORD_TOKEN - discord app token (bot)
-
 - ANTHROPIC_API_KEY - anthropic API key for clauding
-
-
 #### optional
 
 - ANTHROPIC_ADMIN_KEY - your anthropic admin key (i dont think this gets used tbh i havent checked lmao)
