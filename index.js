@@ -2,9 +2,11 @@ import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import Anthropic from "@anthropic-ai/sdk";
 import { Resvg } from "@resvg/resvg-js";
 import {
+  ActivityType,
   AttachmentBuilder,
   Client,
   GatewayIntentBits,
@@ -43,6 +45,7 @@ const MAX_HISTORY = 30; // how many bot-related messages from those to send as h
 const DISCORD_LIMIT = 2000;
 const LOG_DIR = "logs";
 const WIPES_FILE = "wipes.json";
+const MODEL_FILE = "model.json";
 
 const MAX_TOOL_ROUNDS = 5; // how many times Claude may call tools before it must answer
 const MAX_DIAGRAMS = 4; // diagrams per reply
@@ -98,7 +101,22 @@ const defaultModel = findPreset(process.env.DEFAULT_MODEL) ?? PRESET_MODELS[0];
 if (process.env.DEFAULT_MODEL && !findPreset(process.env.DEFAULT_MODEL)) {
   console.warn(`DEFAULT_MODEL "${process.env.DEFAULT_MODEL}" isn't an allowed preset; using ${defaultModel.id}.`);
 }
-let currentModel = defaultModel;
+// Start on the model chosen before the last restart, if it's still an allowed preset.
+let currentModel = findPreset(loadSavedModel()) ?? defaultModel;
+
+function loadSavedModel() {
+  try {
+    return JSON.parse(readFileSync(MODEL_FILE, "utf8")).model;
+  } catch {
+    return undefined; // never switched (or unreadable file)
+  }
+}
+
+async function setCurrentModel(preset) {
+  currentModel = preset;
+  setModelStatus(preset.id);
+  await writeFile(MODEL_FILE, JSON.stringify({ model: preset.id }, null, 2), "utf8");
+}
 
 // Channel ID → timestamp of the last /wipe. Messages older than that are left out of history.
 const wipes = new Map(Object.entries(loadWipes()));
@@ -121,6 +139,7 @@ const discord = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
+  presence: { status: "online" },
 });
 
 const modelCommand = new SlashCommandBuilder()
@@ -149,8 +168,28 @@ const commandHandlers = {
 
 discord.once("clientReady", async (c) => {
   await c.application.commands.set([modelCommand, wipeCommand, resetModelCommand].map((cmd) => cmd.toJSON()));
+  setModelStatus(currentModel.id);
   console.log(`Logged in as ${c.user.tag} — using ${currentModel.id}`);
 });
+
+let statusModelId; // the model shown in the bot's profile status
+
+// Show a model in the bot's custom status. Skips the update when it's already shown.
+function setModelStatus(modelId) {
+  if (!modelId || modelId === statusModelId) return;
+  statusModelId = modelId;
+  const name = findPreset(modelId)?.name ?? modelId; // fallback models may not be presets
+  discord.user.setPresence({
+    status: "online",
+    activities: [{ type: ActivityType.Custom, name: "custom", state: `Running on ${name}` }],
+  });
+}
+
+// The model that produced a response: after a refusal fallback, that's the last fallback block's target.
+function respondingModel(response) {
+  const fallback = response.content.findLast((block) => block.type === "fallback");
+  return fallback?.to.model ?? response.model;
+}
 
 discord.on("messageCreate", async (message) => {
   if (message.author.bot || !message.inGuild() || !isServerAllowed(message.guildId)) return;
@@ -235,7 +274,7 @@ async function handleModelCommand(interaction) {
     return;
   }
 
-  currentModel = preset;
+  await setCurrentModel(preset);
   await interaction.reply(`Model set to **${preset.name}** (\`${preset.id}\`).`);
 }
 
@@ -250,7 +289,7 @@ async function handleWipeCommand(interaction) {
 async function handleResetModelCommand(interaction) {
   if (!(await requireManageGuild(interaction, "reset the model"))) return;
 
-  currentModel = defaultModel;
+  await setCurrentModel(defaultModel);
   await interaction.reply(`Model reset to the default: **${defaultModel.name}** (\`${defaultModel.id}\`).`);
 }
 
@@ -335,6 +374,8 @@ async function respond(message) {
         .map((block) => runTool(block, diagrams));
       messages.push({ role: "user", content: toolResults });
     }
+
+    setModelStatus(respondingModel(response));
 
     if (response.stop_reason === "refusal") {
       const refusal = "Sorry, I can't help with that one.";
@@ -463,5 +504,27 @@ function describeError(err) {
   if (err instanceof Anthropic.APIError) return `API error ${err.status}: ${err.message}`;
   return err.message ?? String(err);
 }
+
+// Go offline right away on shutdown instead of waiting for Discord to time the connection out.
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    if (discord.isReady()) {
+      discord.user.setPresence({ status: "invisible", activities: [] });
+      await sleep(500); // give the presence update time to reach the gateway before closing
+    }
+    await discord.destroy(); // a clean close also tells Discord the bot is gone
+  } catch (err) {
+    console.error("Error while shutting down:", err);
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+// On Windows, pm2 can't send signals, so it sends this message instead (needs shutdown_with_message).
+process.on("message", (msg) => msg === "shutdown" && shutdown());
 
 discord.login(process.env.DISCORD_TOKEN);
