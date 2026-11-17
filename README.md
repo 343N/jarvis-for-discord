@@ -21,6 +21,6 @@ env file has settings and your api keys and shit
 - ALLOWED_SERVERS - servers (guilds) that this bot can operate in, so you dont get some yee-yee ass adding it thtier server and stealing all ur tokens (e.g. 951303485681293684,316897461284445665)
 
 
-### pm2
+## pm2
 
 if you use pm2 it'll put the bot offline as soon as the shutdown signal is sent so that the bot isn't faking being online lmao
